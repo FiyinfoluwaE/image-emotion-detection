@@ -1,0 +1,11 @@
+
+# Required libraries for the emotion detection project
+# Streamlit provides the web framework used to host the model
+streamlit
+emotiefflib[torch]
+facenet-pytorch
+torch
+torchvision
+pillow
+numpy
+opencv-python-headless
