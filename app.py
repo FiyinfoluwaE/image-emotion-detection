@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sqlite3
 from datetime import datetime
 from typing import Optional, Tuple
@@ -12,28 +13,64 @@ from PIL import Image
 from facenet_pytorch import MTCNN
 from emotiefflib.facial_analysis import EmotiEffLibRecognizer, get_model_list
 
+# Database support
+USE_POSTGRES = "DATABASE_URL" in os.environ
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
 
-def init_database(db_path: str = "emotion_app.db") -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            image BLOB NOT NULL,
-            emotion TEXT NOT NULL,
-            confidence REAL NOT NULL
+
+def init_database():
+    """Initialize database (SQLite or PostgreSQL based on DATABASE_URL env var)"""
+    if USE_POSTGRES:
+        try:
+            conn = psycopg2.connect(os.environ["DATABASE_URL"])
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    image BYTEA NOT NULL,
+                    emotion TEXT NOT NULL,
+                    confidence REAL NOT NULL
+                )
+                """
+            )
+            # Create indexes for better performance
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timestamp ON usage(timestamp DESC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_name ON usage(name)"
+            )
+            conn.commit()
+            return conn
+        except psycopg2.Error as e:
+            st.error(f"PostgreSQL connection error: {e}")
+            return None
+    else:
+        conn = sqlite3.connect("emotion_app.db", check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                image BLOB NOT NULL,
+                emotion TEXT NOT NULL,
+                confidence REAL NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    return conn
+        conn.commit()
+        return conn
 
 
 def save_result(
-    conn: sqlite3.Connection,
+    conn,
     name: str,
     image_bytes: bytes,
     emotion: str,
@@ -42,12 +79,24 @@ def save_result(
 ) -> None:
     if timestamp is None:
         timestamp = datetime.utcnow().isoformat()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO usage (name, timestamp, image, emotion, confidence) VALUES (?, ?, ?, ?, ?)",
-        (name, timestamp, image_bytes, emotion, confidence),
-    )
-    conn.commit()
+    
+    if USE_POSTGRES and conn is not None:
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO usage (name, timestamp, image, emotion, confidence) VALUES (%s, %s, %s, %s, %s)",
+                (name, timestamp, image_bytes, emotion, confidence),
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            st.error(f"Database error: {e}")
+    else:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO usage (name, timestamp, image, emotion, confidence) VALUES (?, ?, ?, ?, ?)",
+            (name, timestamp, image_bytes, emotion, confidence),
+        )
+        conn.commit()
 
 
 def detect_first_face(frame: np.ndarray, device: str) -> Optional[np.ndarray]:
@@ -74,20 +123,28 @@ def classify_emotion(recognizer, face_img: np.ndarray) -> Tuple[str, float]:
     return label, confidence
 
 
-def render_history(conn: sqlite3.Connection) -> None:
+def render_history(conn) -> None:
+    if conn is None:
+        st.error("Database connection failed")
+        return
+    
     expander = st.expander("See usage history")
     with expander:
-        cursor = conn.cursor()
-        rows = cursor.execute(
-            "SELECT name, timestamp, emotion, confidence FROM usage ORDER BY id DESC LIMIT 100"
-        ).fetchall()
-        if rows:
-            st.write("## Recent entries")
-            for row in rows:
-                name, ts, emotion, conf = row
-                st.write(f"{ts} – {name}: {emotion} ({conf:.2f})")
-        else:
-            st.info("No records found.")
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, timestamp, emotion, confidence FROM usage ORDER BY id DESC LIMIT 100"
+            )
+            rows = cursor.fetchall()
+            if rows:
+                st.write("## Recent entries")
+                for row in rows:
+                    name, ts, emotion, conf = row
+                    st.write(f"{ts} – {name}: {emotion} ({conf:.2f})")
+            else:
+                st.info("No records found.")
+        except Exception as e:
+            st.error(f"Error fetching history: {e}")
 
 
 def main() -> None:
